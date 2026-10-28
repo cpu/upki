@@ -365,8 +365,9 @@ fn check_cert_denylist(cert: &CertificateDer<'_>) -> Result<(), Error> {
 ///
 /// Returns [`Error::CompromisedKey`] if the presented key is in the denylist.
 fn check_spki_denylist(spki: &SubjectPublicKeyInfoDer<'_>) -> Result<(), Error> {
+    let hash = sha256::Digest::from(&[spki.as_ref()][..]).0;
     for (blocked, why) in SPKI_DENYLIST {
-        if spki.as_ref() == *blocked {
+        if hash == *blocked {
             return Err(Error::CompromisedKey(why));
         }
     }
@@ -374,37 +375,78 @@ fn check_spki_denylist(spki: &SubjectPublicKeyInfoDer<'_>) -> Result<(), Error> 
     Ok(())
 }
 
-const SPKI_DENYLIST: &[(&[u8], &str)] = &[
+// SHA-256 fingerprints of the complete DER-encoded SubjectPublicKeyInfo.
+const SPKI_DENYLIST: &[([u8; 32], &str)] = &[
+    // EMDVTLSCAG3B.spki.der
     (
-        include_bytes!("data/EMDVTLSCAG3B.spki.der"),
+        [
+            0xeb, 0xed, 0x64, 0x75, 0xc2, 0xc2, 0xd8, 0x0f, 0xcb, 0x19, 0x9f, 0x3f, 0xe8, 0xdd,
+            0x6e, 0x6b, 0x3c, 0xe6, 0x0b, 0x77, 0xeb, 0x15, 0xd4, 0xe4, 0x2c, 0x3d, 0xec, 0x0c,
+            0x6f, 0x5b, 0x51, 0x05,
+        ],
         "the private key is 156",
     ),
+    // EMDVTLSCAG3C.spki.der
     (
-        include_bytes!("data/EMDVTLSCAG3C.spki.der"),
+        [
+            0x49, 0xdd, 0x35, 0x3d, 0xc2, 0xb9, 0x19, 0xa3, 0x77, 0x06, 0x45, 0x11, 0x7d, 0x0e,
+            0x60, 0xc1, 0x61, 0x15, 0xe7, 0xd1, 0xbc, 0x25, 0x9e, 0xef, 0xe7, 0x34, 0xb0, 0x0e,
+            0xa4, 0x34, 0xfe, 0x5f,
+        ],
         "the private key is 230",
     ),
+    // EMEVTLSCAG3B.spki.der
     (
-        include_bytes!("data/EMEVTLSCAG3B.spki.der"),
+        [
+            0xe0, 0x25, 0x4c, 0x7f, 0xcd, 0xc2, 0x65, 0xe2, 0xf0, 0xf8, 0xa4, 0x28, 0xda, 0xbb,
+            0x75, 0xab, 0x4a, 0xe0, 0x39, 0xb4, 0x87, 0x2d, 0x62, 0xf5, 0xee, 0x57, 0xf0, 0x87,
+            0x7d, 0x5a, 0x8a, 0x41,
+        ],
         "the private key is 115",
     ),
+    // EMEVTLSCAG3C.spki.der
     (
-        include_bytes!("data/EMEVTLSCAG3C.spki.der"),
+        [
+            0x5c, 0x06, 0x60, 0xa2, 0xb1, 0x64, 0x91, 0x0d, 0x8f, 0xf5, 0x89, 0xc1, 0x8e, 0x14,
+            0x55, 0x2e, 0x9e, 0x0e, 0xc2, 0x37, 0xdc, 0xef, 0xe2, 0xcb, 0x73, 0x6d, 0x41, 0xa4,
+            0x81, 0x1f, 0x81, 0xa0,
+        ],
         "the private key is 56",
     ),
+    // EMOVTLSCAG3B.spki.der
     (
-        include_bytes!("data/EMOVTLSCAG3B.spki.der"),
+        [
+            0x43, 0xbf, 0xfa, 0x19, 0xd6, 0xef, 0x65, 0x14, 0x51, 0xf6, 0x84, 0x1e, 0x01, 0x99,
+            0x31, 0xe9, 0x6f, 0x6f, 0x2e, 0xae, 0xff, 0x28, 0xab, 0x4b, 0x6f, 0x1c, 0xe4, 0x57,
+            0x6d, 0xe2, 0x71, 0x7b,
+        ],
         "the private key is 155",
     ),
+    // EMOVTLSCAG3C.spki.der
     (
-        include_bytes!("data/EMOVTLSCAG3C.spki.der"),
+        [
+            0x63, 0xec, 0xef, 0xee, 0x43, 0x1d, 0x49, 0x52, 0x3b, 0xc1, 0x13, 0x6c, 0x4e, 0x72,
+            0xd0, 0x20, 0x6a, 0x47, 0x70, 0x86, 0xca, 0xf6, 0x06, 0xcd, 0x5c, 0xf0, 0x25, 0x68,
+            0x6c, 0x10, 0x9c, 0xf8,
+        ],
         "the private key is 4",
     ),
+    // EMOVCSCAG3B.spki.der
     (
-        include_bytes!("data/EMOVCSCAG3B.spki.der"),
+        [
+            0xec, 0x4f, 0xfa, 0x1a, 0xd0, 0xac, 0x88, 0x08, 0x13, 0x14, 0xb7, 0xaa, 0xff, 0xef,
+            0x6a, 0x91, 0xf9, 0x7c, 0xd5, 0x72, 0x91, 0xbb, 0x5b, 0xa6, 0x86, 0xc5, 0x41, 0x5f,
+            0x5e, 0xb4, 0xf6, 0xb6,
+        ],
         "the private key is 66",
     ),
+    // EMOVCSCAG3C.spki.der
     (
-        include_bytes!("data/EMOVCSCAG3C.spki.der"),
+        [
+            0x92, 0xc0, 0x63, 0xd6, 0x7e, 0x8f, 0x14, 0xdb, 0x71, 0xd2, 0x88, 0xe1, 0x12, 0x66,
+            0xff, 0xda, 0xf6, 0x9c, 0xbf, 0x11, 0x5f, 0x7b, 0xab, 0x14, 0xf3, 0xbc, 0x2f, 0x68,
+            0xd2, 0x5e, 0x0e, 0x30,
+        ],
         "the private key is 237",
     ),
 ];
@@ -579,12 +621,48 @@ mod tests {
 
     #[test]
     fn test_spki_denylist() {
-        assert!(matches!(
-            check_spki_denylist(&SubjectPublicKeyInfoDer::from(
-                &include_bytes!("data/EMDVTLSCAG3B.spki.der")[..],
-            )),
-            Err(Error::CompromisedKey(_))
-        ));
+        let fixtures: &[(&[u8], &str)] = &[
+            (
+                include_bytes!("data/EMDVTLSCAG3B.spki.der"),
+                "the private key is 156",
+            ),
+            (
+                include_bytes!("data/EMDVTLSCAG3C.spki.der"),
+                "the private key is 230",
+            ),
+            (
+                include_bytes!("data/EMEVTLSCAG3B.spki.der"),
+                "the private key is 115",
+            ),
+            (
+                include_bytes!("data/EMEVTLSCAG3C.spki.der"),
+                "the private key is 56",
+            ),
+            (
+                include_bytes!("data/EMOVTLSCAG3B.spki.der"),
+                "the private key is 155",
+            ),
+            (
+                include_bytes!("data/EMOVTLSCAG3C.spki.der"),
+                "the private key is 4",
+            ),
+            (
+                include_bytes!("data/EMOVCSCAG3B.spki.der"),
+                "the private key is 66",
+            ),
+            (
+                include_bytes!("data/EMOVCSCAG3C.spki.der"),
+                "the private key is 237",
+            ),
+        ];
+        assert_eq!(fixtures.len(), SPKI_DENYLIST.len());
+        for ((der, expected_reason), (expected_hash, _)) in fixtures.iter().zip(SPKI_DENYLIST) {
+            assert_eq!(sha256::Digest::from(&[*der][..]).0, *expected_hash);
+            assert!(matches!(
+                check_spki_denylist(&SubjectPublicKeyInfoDer::from(*der)),
+                Err(Error::CompromisedKey(reason)) if reason == *expected_reason
+            ));
+        }
         assert!(check_spki_denylist(&SubjectPublicKeyInfoDer::from(&[0, 1, 2][..])).is_ok());
     }
 }
