@@ -200,6 +200,22 @@ mod platform {
     }
 }
 
+// Browser WASM has no conventional system configuration or cache directories.
+// Consumers using browser-managed storage do not call these paths, but defining
+// the platform module keeps the platform-independent revocation APIs available.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod platform {
+    use super::*;
+
+    pub(super) fn system_config_dir() -> Result<PathBuf, Error> {
+        Err(Error::NoConfigDirectoryFound)
+    }
+
+    pub(super) fn system_cache_dir() -> Result<PathBuf, Error> {
+        Err(Error::NoCacheDirectoryFound)
+    }
+}
+
 /// Errors for the upki library API.
 #[non_exhaustive]
 #[derive(Debug)]

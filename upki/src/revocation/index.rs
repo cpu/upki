@@ -1,17 +1,14 @@
 use core::cmp::Ordering;
 use core::{fmt, str};
-#[cfg(feature = "__fetch")]
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
-#[cfg(feature = "__fetch")]
 use clubcard_crlite::TimestampInterval;
 use clubcard_crlite::{CRLiteClubcard, CRLiteStatus, LogId, Timestamp};
 
 use super::{Error, RevocationCheckInput, RevocationStatus};
-#[cfg(feature = "__fetch")]
 use crate::data::Manifest;
 #[cfg(feature = "__fetch")]
 use crate::fetch::PostProcess;
@@ -51,7 +48,7 @@ use crate::fetch::PostProcess;
 /// `filter_index` as `u8`. Both versions are read, but writing always produces
 /// "upkiidx1".
 ///
-/// This type stores a [`File`] for on-demand reading of entry sections.
+/// This type stores a seekable reader for on-demand reading of entry sections.
 pub(crate) struct Index {
     num_filenames: usize,
     num_logs: usize,
@@ -60,8 +57,11 @@ pub(crate) struct Index {
     entry_size: usize,
     /// Contains the filename table followed by the log table.
     tables: Vec<u8>,
-    file: File,
+    reader: Box<dyn ReadSeek>,
 }
+
+trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
 
 impl Index {
     /// Read the index header from the cache directory specified in `config`.
@@ -70,7 +70,7 @@ impl Index {
     /// Entry sections are read on demand during [`check`](Self::check) via seeking.
     pub(super) fn from_path(cache_dir: &Path) -> Result<Self, Error> {
         let index_path = cache_dir.join(INDEX_BIN);
-        let mut file = match File::open(&index_path) {
+        let file = match File::open(&index_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(Error::NoData { path: index_path });
@@ -83,9 +83,28 @@ impl Index {
             }
         };
 
+        let file_len = file
+            .metadata()
+            .map_err(|error| Error::FileRead {
+                error,
+                path: Some(index_path.clone()),
+            })?
+            .len();
+
+        Self::from_reader(Box::new(file), file_len)
+    }
+
+    /// Read an index held in memory.
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Result<Self, Error> {
+        let file_len = bytes.len() as u64;
+        Self::from_reader(Box::new(Cursor::new(bytes)), file_len)
+    }
+
+    fn from_reader(mut reader: Box<dyn ReadSeek>, file_len: u64) -> Result<Self, Error> {
         // Read 1: magic, determining the version-dependent header and entry sizes
         let mut magic = [0u8; 8];
-        file.read_exact(&mut magic)
+        reader
+            .read_exact(&mut magic)
             .map_err(|e| Error::IndexDecode(Box::new(e)))?;
         let (header_size, entry_size) = if magic == *INDEX_MAGIC_V1 {
             (HEADER_SIZE_V1, ENTRY_SIZE_V1)
@@ -98,7 +117,8 @@ impl Index {
         // Read 2: num_filenames + num_log_ids
         let mut header = [0u8; HEADER_SIZE_V1 - 8];
         let header = &mut header[..header_size - 8];
-        file.read_exact(header)
+        reader
+            .read_exact(header)
             .map_err(|e| Error::IndexDecode(Box::new(e)))?;
         let mut data = &*header;
         let num_filenames = match entry_size {
@@ -121,14 +141,6 @@ impl Index {
 
         // A corrupt `num_log_ids` could demand an unreasonable sized allocation. Cap the table
         // allocation to the file's overall size.
-        let file_len = file
-            .metadata()
-            .map_err(|error| Error::FileRead {
-                error,
-                path: Some(index_path),
-            })?
-            .len();
-
         let Some(tables_end) = header_size.checked_add(tables_len) else {
             return Err(Error::IndexDecode("table end overflow".into()));
         };
@@ -138,7 +150,8 @@ impl Index {
         }
 
         let mut tables = vec![0u8; tables_len];
-        file.read_exact(&mut tables)
+        reader
+            .read_exact(&mut tables)
             .map_err(|e| Error::IndexDecode(Box::new(e)))?;
 
         Ok(Self {
@@ -147,42 +160,34 @@ impl Index {
             logs_offset,
             entry_size,
             tables,
-            file,
+            reader,
         })
     }
 
-    /// Build index bytes by reading filter files from `dir` and extracting universe metadata.
-    ///
-    /// Returns `None` if any filter file cannot be read or decoded.
-    #[cfg(feature = "__fetch")]
-    pub(crate) fn write(manifest: &Manifest, dir: &Path) -> Option<Vec<u8>> {
+    /// Build index bytes from a manifest and an arbitrary filter source.
+    pub(super) fn build(
+        manifest: &Manifest,
+        mut read_filter: impl FnMut(&str) -> Result<Vec<u8>, Error>,
+    ) -> Result<Vec<u8>, Error> {
         let mut by_log_id: BTreeMap<LogId, Vec<(u16, TimestampInterval)>> = BTreeMap::new();
 
         for (filter_idx, filter) in manifest.files.iter().enumerate() {
             if filter.filename.len() > FILENAME_SIZE {
-                tracing::warn!(
-                    "skipping index: filename {:?} exceeds {FILENAME_SIZE} bytes",
-                    filter.filename
-                );
-                return None;
+                return Err(Error::IndexDecode(
+                    format!(
+                        "filename {:?} exceeds {FILENAME_SIZE} bytes",
+                        filter.filename
+                    )
+                    .into(),
+                ));
             }
 
-            let path = dir.join(&filter.filename);
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!("skipping index: cannot read {path:?}: {error}");
-                    return None;
-                }
-            };
-
-            let clubcard = match CRLiteClubcard::from_bytes(&bytes) {
-                Ok(c) => c,
-                Err(error) => {
-                    tracing::warn!("skipping index: cannot decode {path:?}: {error:?}");
-                    return None;
-                }
-            };
+            let bytes = read_filter(&filter.filename)?;
+            let clubcard =
+                CRLiteClubcard::from_bytes(&bytes).map_err(|error| Error::FileDecode {
+                    error: Box::new(error),
+                    path: Some(filter.filename.clone().into()),
+                })?;
 
             for (log_id, interval) in clubcard.universe().iter() {
                 by_log_id
@@ -192,6 +197,29 @@ impl Index {
             }
         }
 
+        Ok(Self::encode(manifest, &by_log_id))
+    }
+
+    /// Build index bytes by reading filter files from `dir` and extracting universe metadata.
+    ///
+    /// Returns `None` if any filter file cannot be read or decoded.
+    #[cfg(feature = "__fetch")]
+    pub(crate) fn write(manifest: &Manifest, dir: &Path) -> Option<Vec<u8>> {
+        Self::build(manifest, |filename| {
+            let path = dir.join(filename);
+            fs::read(&path).map_err(|error| Error::FileRead {
+                error,
+                path: Some(path),
+            })
+        })
+        .inspect_err(|error| tracing::warn!("skipping index: {error}"))
+        .ok()
+    }
+
+    fn encode(
+        manifest: &Manifest,
+        by_log_id: &BTreeMap<LogId, Vec<(u16, TimestampInterval)>>,
+    ) -> Vec<u8> {
         // Compute header size to determine entry section offsets
         let header_size = HEADER_SIZE_V1
             + manifest.files.len() * FILENAME_SIZE
@@ -214,7 +242,7 @@ impl Index {
         // Pre-compute offsets for each log_id's entry section
         let mut current_offset = header_size;
         let mut dir_entries: Vec<(&LogId, u64, u16)> = Vec::new();
-        for (log_id, entries) in &by_log_id {
+        for (log_id, entries) in by_log_id {
             dir_entries.push((log_id, current_offset as u64, entries.len() as u16));
             current_offset += entries.len() * ENTRY_SIZE_V1;
         }
@@ -235,7 +263,7 @@ impl Index {
             }
         }
 
-        Some(buf)
+        buf
     }
 
     /// Perform a revocation check using the index.
@@ -248,6 +276,22 @@ impl Index {
         &mut self,
         input: &RevocationCheckInput,
         cache_dir: &Path,
+    ) -> Result<RevocationStatus, Error> {
+        self.check_with(input, |filename| {
+            let path = cache_dir.join(filename);
+            let bytes = fs::read(&path).map_err(|error| Error::FileRead {
+                error,
+                path: Some(path.clone()),
+            })?;
+            Ok((bytes, Some(path)))
+        })
+    }
+
+    /// Perform a revocation check using an arbitrary filter source.
+    pub(super) fn check_with(
+        &mut self,
+        input: &RevocationCheckInput,
+        mut read_filter: impl FnMut(&str) -> Result<(Vec<u8>, Option<std::path::PathBuf>), Error>,
     ) -> Result<RevocationStatus, Error> {
         let key = input.key();
         let dir_data = &self.tables[self.logs_offset..];
@@ -277,12 +321,12 @@ impl Index {
             let offset = u64::read_be(&mut entry_data)?;
             let count = u16::read_be(&mut entry_data)?;
 
-            self.file
+            self.reader
                 .seek(SeekFrom::Start(offset))
                 .map_err(|e| Error::IndexDecode(Box::new(e)))?;
 
             let mut buf = vec![0u8; count as usize * self.entry_size];
-            self.file
+            self.reader
                 .read_exact(&mut buf)
                 .map_err(|e| Error::IndexDecode(Box::new(e)))?;
 
@@ -309,21 +353,12 @@ impl Index {
                 }
                 seen[filter_index] = true;
 
-                let path = cache_dir.join(filename);
-                let bytes = match fs::read(&path) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        return Err(Error::FileRead {
-                            error,
-                            path: Some(path),
-                        });
-                    }
-                };
+                let (bytes, path) = read_filter(filename)?;
 
                 let filter =
                     CRLiteClubcard::from_bytes(&bytes).map_err(|error| Error::FileDecode {
                         error: format!("cannot decode crlite filter: {error:?}").into(),
-                        path: Some(path),
+                        path,
                     })?;
 
                 match filter.contains(
@@ -388,7 +423,7 @@ impl fmt::Debug for Index {
             logs_offset,
             entry_size: _,
             tables: _,
-            file: _,
+            reader: _,
         } = self;
 
         f.debug_struct("Index")
@@ -605,6 +640,22 @@ mod tests {
 
         assert_eq!(
             Index::from_path(dir.path())?.check(&test_input(), dir.path())?,
+            RevocationStatus::CertainlyRevoked,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_memory_backed_index_and_filter() -> Result<(), Box<dyn StdError>> {
+        let filter = build_filter([0xaa; 32], &[SERIAL], &[], &[([0xbb; 32], 0, 2000)]);
+        let mut index = Index::from_bytes(build_index(&[("f0.filter", &[([0xbb; 32], 0, 2000)])]))?;
+
+        assert_eq!(
+            index.check_with(&test_input(), |filename| {
+                assert_eq!(filename, "f0.filter");
+                Ok((filter.clone(), None))
+            })?,
             RevocationStatus::CertainlyRevoked,
         );
 

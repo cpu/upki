@@ -3,6 +3,7 @@ use core::error::Error as StdError;
 use core::iter;
 use core::str::FromStr;
 use core::{fmt, str};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -100,6 +101,72 @@ impl Store {
     pub fn validate(&self) -> Result<(), Error> {
         Index::from_path(&self.cache_dir).map(|_| ())
     }
+}
+
+/// A revocation data store backed entirely by caller-provided bytes.
+///
+/// This is useful on platforms without a conventional filesystem, including
+/// web browsers. The index and filters use exactly the same encodings as the
+/// on-disk [`Store`].
+pub struct MemoryStore {
+    index: Index,
+    filters: BTreeMap<String, Vec<u8>>,
+}
+
+impl MemoryStore {
+    /// Construct a store from an encoded `index.bin` and named filter files.
+    ///
+    /// The index is validated immediately. Individual Clubcard filters are
+    /// decoded lazily if a check selects them.
+    pub fn new(
+        index: Vec<u8>,
+        filters: impl IntoIterator<Item = (String, Vec<u8>)>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            index: Index::from_bytes(index)?,
+            filters: filters.into_iter().collect(),
+        })
+    }
+
+    /// Perform a revocation check using the in-memory index and filters.
+    pub fn check(&mut self, input: &RevocationCheckInput) -> Result<RevocationStatus, Error> {
+        let filters = &self.filters;
+        self.index
+            .check_with(input, |filename| {
+                let bytes = filters
+                    .get(filename)
+                    .cloned()
+                    .ok_or_else(|| Error::FileRead {
+                        error: io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "filter is not in memory store",
+                        ),
+                        path: Some(filename.into()),
+                    })?;
+                Ok((bytes, Some(filename.into())))
+            })
+    }
+}
+
+/// Build encoded `index.bin` bytes from a manifest and named Clubcard filters.
+///
+/// This is the in-memory equivalent of the post-processing step performed by
+/// the native fetch path. It is available without a fetch feature so applications
+/// can provide their own transport and storage.
+pub fn build_index(
+    manifest: &Manifest,
+    filters: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> Result<Vec<u8>, Error> {
+    let filters: BTreeMap<_, _> = filters.into_iter().collect();
+    Index::build(manifest, |filename| {
+        filters
+            .get(filename)
+            .cloned()
+            .ok_or_else(|| Error::FileRead {
+                error: io::Error::new(io::ErrorKind::NotFound, "filter is not available"),
+                path: Some(filename.into()),
+            })
+    })
 }
 
 /// Input parameters for a revocation check.
